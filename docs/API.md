@@ -29,6 +29,17 @@ curl -X POST \
   http://127.0.0.1:8080/api/v1/nodes/node-01/provision
 ```
 
-The current M0 provisioning endpoint is deliberately synchronous and simulated.
-The next M0 increment replaces it with an asynchronous job/state-machine API
-and moves hardware operations behind backend interfaces.
+Provisioning is asynchronous. A successful request returns HTTP `202 Accepted` and a job object.
+
+Poll:
+
+```sh
+curl http://127.0.0.1:8080/api/v1/jobs/job-000001
+```
+
+Job states are currently `queued`, `running`, `completed` and `failed`.
+The simulated provisioning state machine exposes steps including power-off,
+attach-media, boot-installer, detach-media and verify.
+
+Power, reset and virtual-media operations are behind backend interfaces. M1 can
+therefore add physical implementations without changing the public lifecycle API.
