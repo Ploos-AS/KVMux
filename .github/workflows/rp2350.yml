@@ -1,0 +1,36 @@
+name: RP2350 firmware
+on:
+  push:
+    paths:
+      - 'firmware/controller/**'
+      - '.github/workflows/rp2350.yml'
+  pull_request:
+    paths:
+      - 'firmware/controller/**'
+      - '.github/workflows/rp2350.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install ARM embedded toolchain
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build gcc-arm-none-eabi libnewlib-arm-none-eabi
+      - name: Fetch Pico SDK
+        run: git clone --depth 1 --branch 2.1.1 https://github.com/raspberrypi/pico-sdk.git /tmp/pico-sdk && git -C /tmp/pico-sdk submodule update --init --recursive
+      - name: Configure
+        env:
+          PICO_SDK_PATH: /tmp/pico-sdk
+        run: cmake -S firmware/controller -B build/rp2350 -G Ninja -DPICO_BOARD=pico2 -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build/rp2350
+      - name: Upload UF2
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvmux-rp2350-uf2
+          path: build/rp2350/kvmux_controller.uf2
+          if-no-files-found: error
