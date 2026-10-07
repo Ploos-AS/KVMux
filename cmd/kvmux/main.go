@@ -38,11 +38,21 @@ type Job struct {
 	Error string `json:"error,omitempty"`
 }
 
+type Event struct {
+	Time time.Time `json:"time"`
+	NodeID string `json:"node_id,omitempty"`
+	JobID string `json:"job_id,omitempty"`
+	Action string `json:"action"`
+	Result string `json:"result"`
+}
+
 type Server struct {
 	mu sync.Mutex
 	nodes map[string]*Node
 	images map[string]Image
 	jobs map[string]*Job
+	events []Event
+	busy map[string]string
 	jobSeq uint64
 	power PowerBackend
 	reset ResetBackend
@@ -51,7 +61,7 @@ type Server struct {
 
 func newServer() *Server {
 	b:=SimBackend{}
-	s:=&Server{nodes:map[string]*Node{},images:map[string]Image{},jobs:map[string]*Job{},
+	s:=&Server{nodes:map[string]*Node{},images:map[string]Image{},jobs:map[string]*Job{},busy:map[string]string{},
 		power:b,reset:b,media:b}
 	for i:=1;i<=8;i++ {
 		id:=fmt.Sprintf("node-%02d",i)
@@ -76,6 +86,13 @@ func (s *Server) imagesHandler(w http.ResponseWriter,r *http.Request) {
 	s.mu.Lock(); defer s.mu.Unlock()
 	out:=make([]Image,0,len(s.images)); for _,im:=range s.images { out=append(out,im) }; writeJSON(w,200,out)
 }
+func (s *Server) eventsHandler(w http.ResponseWriter,r *http.Request) {
+	if r.Method!="GET" { http.Error(w,"method not allowed",405); return }
+	s.mu.Lock(); defer s.mu.Unlock(); writeJSON(w,200,s.events)
+}
+func (s *Server) audit(node,job,action,result string) {
+	s.events=append(s.events,Event{Time:time.Now().UTC(),NodeID:node,JobID:job,Action:action,Result:result})
+}
 func (s *Server) jobsHandler(w http.ResponseWriter,r *http.Request) {
 	if r.Method!="GET" { http.Error(w,"method not allowed",405); return }
 	id:=strings.TrimPrefix(r.URL.Path,"/api/v1/jobs/")
@@ -91,15 +108,18 @@ func (s *Server) nodeHandler(w http.ResponseWriter,r *http.Request) {
 	if len(parts)==4 && r.Method=="GET" { writeJSON(w,200,n); s.mu.Unlock(); return }
 	if r.Method!="POST" { s.mu.Unlock(); http.Error(w,"method not allowed",405); return }
 	action:=strings.Join(parts[4:],"/")
+	if owner:=s.busy[id]; owner!="" && action!="provision" {
+		s.mu.Unlock(); http.Error(w,"node busy with "+owner,http.StatusLocked); return
+	}
 	switch action {
 	case "power/on":
-		err:=s.power.On(n); if err!=nil { s.mu.Unlock(); http.Error(w,err.Error(),409); return }
+		s.audit(id,"","power/on","requested"); err:=s.power.On(n); if err!=nil { s.mu.Unlock(); http.Error(w,err.Error(),409); return }
 	case "power/off":
-		err:=s.power.Off(n); if err!=nil { s.mu.Unlock(); http.Error(w,err.Error(),409); return }
+		s.audit(id,"","power/off","requested"); err:=s.power.Off(n); if err!=nil { s.mu.Unlock(); http.Error(w,err.Error(),409); return }
 	case "power/cycle":
-		err:=s.power.Cycle(n,100*time.Millisecond); if err!=nil { s.mu.Unlock(); http.Error(w,err.Error(),409); return }
+		s.audit(id,"","power/cycle","requested"); err:=s.power.Cycle(n,100*time.Millisecond); if err!=nil { s.mu.Unlock(); http.Error(w,err.Error(),409); return }
 	case "reset":
-		err:=s.reset.Reset(n); if err!=nil { s.mu.Unlock(); http.Error(w,err.Error(),409); return }
+		s.audit(id,"","reset","requested"); err:=s.reset.Reset(n); if err!=nil { s.mu.Unlock(); http.Error(w,err.Error(),409); return }
 	case "media/attach":
 		var req struct{ Image string `json:"image"` }; if json.NewDecoder(r.Body).Decode(&req)!=nil { s.mu.Unlock(); http.Error(w,"invalid json",400); return }
 		im,ok:=s.images[req.Image]; if !ok { s.mu.Unlock(); http.Error(w,"image not found",404); return }
@@ -109,9 +129,10 @@ func (s *Server) nodeHandler(w http.ResponseWriter,r *http.Request) {
 	case "provision":
 		var req struct{ Image string `json:"image"` }; if json.NewDecoder(r.Body).Decode(&req)!=nil { s.mu.Unlock(); http.Error(w,"invalid json",400); return }
 		if _,ok:=s.images[req.Image]; !ok { s.mu.Unlock(); http.Error(w,"image not found",404); return }
+		if owner:=s.busy[id]; owner!="" { s.mu.Unlock(); http.Error(w,"node already has destructive job "+owner,http.StatusLocked); return }
 		jid:=fmt.Sprintf("job-%06d",atomic.AddUint64(&s.jobSeq,1))
 		j:=&Job{ID:jid,Type:"provision",NodeID:id,Image:req.Image,State:"queued",Step:"queued"}
-		s.jobs[jid]=j; s.mu.Unlock(); go s.runProvision(jid); writeJSON(w,http.StatusAccepted,j); return
+		s.jobs[jid]=j; s.busy[id]=jid; s.audit(id,jid,"provision","queued"); s.mu.Unlock(); go s.runProvision(jid); writeJSON(w,http.StatusAccepted,j); return
 	default:
 		s.mu.Unlock(); http.NotFound(w,r); return
 	}
@@ -122,7 +143,9 @@ func (s *Server) jobStep(id,state,step string) {
 	s.mu.Lock(); defer s.mu.Unlock(); if j:=s.jobs[id]; j!=nil { j.State=state; j.Step=step }
 }
 func (s *Server) jobFail(id string,err error) {
-	s.mu.Lock(); defer s.mu.Unlock(); if j:=s.jobs[id]; j!=nil { j.State="failed"; j.Error=err.Error() }
+	s.mu.Lock(); defer s.mu.Unlock(); if j:=s.jobs[id]; j!=nil {
+		j.State="failed"; j.Error=err.Error(); delete(s.busy,j.NodeID); s.audit(j.NodeID,id,"provision","failed")
+	}
 }
 func (s *Server) runProvision(id string) {
 	s.mu.Lock(); j:=s.jobs[id]; n:=s.nodes[j.NodeID]; im:=s.images[j.Image]; s.mu.Unlock()
@@ -132,13 +155,13 @@ func (s *Server) runProvision(id string) {
 	time.Sleep(100*time.Millisecond)
 	s.jobStep(id,"running","detach-media"); s.mu.Lock(); err=s.media.Detach(n); s.mu.Unlock(); if err!=nil { s.jobFail(id,err); return }
 	s.jobStep(id,"running","verify"); s.mu.Lock(); n.Health="healthy"; s.mu.Unlock()
-	s.jobStep(id,"completed","done")
+	s.mu.Lock(); j=s.jobs[id]; j.State="completed"; j.Step="done"; delete(s.busy,j.NodeID); s.audit(j.NodeID,id,"provision","completed"); s.mu.Unlock()
 }
 
 func main() {
 	s:=newServer(); mux:=http.NewServeMux()
 	mux.HandleFunc("/api/v1/nodes",s.nodesHandler); mux.HandleFunc("/api/v1/nodes/",s.nodeHandler)
-	mux.HandleFunc("/api/v1/images",s.imagesHandler); mux.HandleFunc("/api/v1/jobs/",s.jobsHandler)
+	mux.HandleFunc("/api/v1/images",s.imagesHandler); mux.HandleFunc("/api/v1/jobs/",s.jobsHandler); mux.HandleFunc("/api/v1/events",s.eventsHandler)
 	addr:=os.Getenv("KVMUX_LISTEN"); if addr=="" { addr=":8080" }
 	log.Printf("KVMux M0 simulator listening on %s",addr); log.Fatal(http.ListenAndServe(addr,mux))
 }
