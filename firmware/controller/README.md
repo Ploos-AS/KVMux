@@ -20,3 +20,6 @@ Initial bring-up order:
 
 The firmware must boot into a safe state and must not toggle target power merely
 because the Linux host resets or disconnects.
+
+
+M1 CI note: firmware workflow must produce a UF2 artifact before hardware qualification.
