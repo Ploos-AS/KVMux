@@ -132,7 +132,7 @@ func (s *Server) nodeHandler(w http.ResponseWriter,r *http.Request) {
 		if owner:=s.busy[id]; owner!="" { s.mu.Unlock(); http.Error(w,"node already has destructive job "+owner,http.StatusLocked); return }
 		jid:=fmt.Sprintf("job-%06d",atomic.AddUint64(&s.jobSeq,1))
 		j:=&Job{ID:jid,Type:"provision",NodeID:id,Image:req.Image,State:"queued",Step:"queued"}
-		s.jobs[jid]=j; s.busy[id]=jid; s.audit(id,jid,"provision","queued"); s.mu.Unlock(); go s.runProvision(jid); writeJSON(w,http.StatusAccepted,j); return
+		s.jobs[jid]=j; s.busy[id]=jid; s.audit(id,jid,"provision","queued"); response:=*j; s.mu.Unlock(); go s.runProvision(jid); writeJSON(w,http.StatusAccepted,response); return
 	default:
 		s.mu.Unlock(); http.NotFound(w,r); return
 	}
